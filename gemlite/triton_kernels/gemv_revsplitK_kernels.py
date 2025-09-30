@@ -196,12 +196,39 @@ def get_fast_autotune_config_amd():
 def get_default_config_amd():
     config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':32, 'BLOCK_SIZE_K':16, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=1, num_stages=1)
     return [config]
+
+def get_default_config_dcu():
+    configs = []
+    # Hard-code the fixed parameters
+    M, A, D = 1, 0, 0
+
+    # Loop over a small, curated set of parameters
+    for w in [2, 4, 8]:
+        for s in [1, 2, 3, 4, 5, 6]:
+            for N in [64, 128, 256, 512]:
+                for K in [32, 64, 128, 256, 512]:
+                    v = 2 if N >= 256 else 0
+
+                    configs.append(
+                        triton.Config(
+                            {'BLOCK_SIZE_M': M, 'BLOCK_SIZE_N': N, 'BLOCK_SIZE_K': K,
+                             'A_load_order': A, 'dot_prod_mode': D, 'waves_per_eu': v},
+                            num_stages=s, num_warps=w,
+                        )
+                    )
+    # Add a mandatory safe fallback config
+    configs.insert(0, triton.Config(
+        {'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32,
+         'A_load_order': 0, 'dot_prod_mode': 0, 'waves_per_eu': 0},
+        num_warps=1, num_stages=1
+    ))
+    return configs
 ########################################################################################################################################################################
 
 if IS_HIP:
     get_max_autotune_config = get_max_autotune_config_amd
     get_fast_autotune_config = get_fast_autotune_config_amd
-    get_default_config = get_default_config_amd
+    get_default_config = get_default_config_dcu
 else:
     get_max_autotune_config = get_max_autotune_config_nvidia
     get_fast_autotune_config = get_fast_autotune_config_nvidia
@@ -219,7 +246,7 @@ else:
     configs=get_autotune_config(),
     key = KEYS,
     restore_value = ['a_ptr', 'b_ptr', 'c_ptr'],
-    prune_configs_by = {'early_config_prune': kernel_config_pruner},
+    # prune_configs_by = {'early_config_prune': kernel_config_pruner},
     use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
 )
 
