@@ -198,15 +198,17 @@ def get_default_config_amd():
     return [config]
 
 def get_default_config_dcu():
+    config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':64, 'A_load_order':0, 'dot_prod_mode':0, 'waves_per_eu':2}, num_stages=2, num_warps=2, size_per_thread=8)
+    return [config]
     configs = []
     # Hard-code the fixed parameters
     M, A, D = 1, 0, 0
 
     # Loop over a small, curated set of parameters
-    for w in [2, 4, 8]:
-        for s in [1, 2, 3, 4, 5, 6]:
-            for N in [64, 128, 256, 512]:
-                for K in [32, 64, 128, 256, 512]:
+    for w in [1, 2, 4, 8, 16]:
+        for s in [1,2,3,4,5,6,7,8]:
+            for N in [8,16, 32, 64, 128,256]:
+                for K in [8,16,32,64, 128,256]:
                     v = 2 if N >= 256 else 0
 
                     configs.append(
@@ -288,14 +290,6 @@ def gemv_INT_revsplitK_kernel(
     a_evict: tl.constexpr = 'evict_last',
     b_evict: tl.constexpr = 'evict_first',
 ):
-    """
-    GEMV for C = matmul(A, dequantize(B, scales, zeros)). This is optimized for M==1
-    A is of shape (M, K): float16 or bfloat16
-    B is of shape (K // elements_per_sample, N): int32 as a packed matrix
-    C is of shape (M, N): float16 or bfloat16 depending on the input A
-    scales and zeros is of shape (group_size, N): float16 or bfloat16
-    """    
-    
     pid   = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1) * 2
     pid_m, pid_n = pid % M, pid // M
@@ -303,115 +297,37 @@ def gemv_INT_revsplitK_kernel(
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) 
     offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    
-    ############################################################################################################
-    #Offsets
 
     if data_contiguous:
         offs_bn = offs_n  
     else:
         offs_bn = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_SIZE_N), BLOCK_SIZE_N) 
     offs_am = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_SIZE_M), BLOCK_SIZE_M)
-    offs_ak = offs_k
-    offs_bk = offs_k
     
     a_ptrs  = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak  
     b_ptrs  = b_ptr + ((offs_k[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn) 
-    q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
 
-    #Stage 0: Load scales/zeros
-    #-----------------------------------------------------------------------------------------------------------
-    #Load meta data first, for two passes
-    if(W_group_mode > 0):
-        k_m = (pid_k * (BLOCK_SIZE_K / group_size)).to(tl.int32)
-
-    if(W_group_mode >= 2): #[2, 3, 4]
-        scales = tl.load(scales_ptr + offs_bn[None, :] * stride_meta_n + k_m * stride_meta_g, eviction_policy=meta_evict_policy) 
-    else:
-        scales = None
-    
-    if(W_group_mode == 1 or W_group_mode >= 3): #[1, 3, 4]
-        if(zero_is_scalar):
-            zeros = tl.load(zeros_ptr, eviction_policy=meta_evict_policy)
-        else:
-            zeros = tl.load(zeros_ptr  + offs_bn[None, :] * stride_meta_n + k_m * stride_meta_g, eviction_policy=meta_evict_policy) 
-    else:
-        zeros = None
-
-    ############################################################################################################
-    #Stage 1
-    #-----------------------------------------------------------------------------------------------------------
-    #Load
-    if(A_load_order == 0):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
-    
+    a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     b = tl.load(b_ptrs, eviction_policy=b_evict) 
 
-    if(A_load_order == 1):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
-
-    # Unpack and dequantize    
-    b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
-
-    #Dot product
-    if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
-    if(dot_prod_mode == 0):
-        acc = tl.sum(a.to(acc_dtype) * b.to(acc_dtype), axis=0, keep_dims=True)
-    if(dot_prod_mode == 1):
-        acc = tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True).to(acc_dtype)
-    if(dot_prod_mode == 2):
-        acc = tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True)
+    product = a.to(tl.float32) * b.to(tl.float32)
+    acc = tl.sum(product, axis=0, keep_dims=True)
     
-    #Advance and load next chunk
     a_ptrs += BLOCK_SIZE_K * stride_ak
     b_ptrs += (BLOCK_SIZE_K // elements_per_sample) * stride_bk
 
-    #Stage 2
-    #-----------------------------------------------------------------------------------------------------------
-    if(A_load_order == 0):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
-    
+    a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     b = tl.load(b_ptrs, eviction_policy=b_evict) 
 
-    if(A_load_order == 1):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+    product = a.to(tl.float32) * b.to(tl.float32)
+    acc += tl.sum(product, axis=0, keep_dims=True) 
 
-    # Unpack and dequantize    
-    b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
-    
-    #Dot product
-    if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
-    if(dot_prod_mode == 0):
-        acc += tl.sum(a.to(acc_dtype) * b.to(acc_dtype), axis=0, keep_dims=True) 
-    if(dot_prod_mode == 1):
-        acc += tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True).to(acc_dtype)
-    if(dot_prod_mode == 2):
-        acc += tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True)
-
-    if(dump_b_val > 0): acc /= dump_b_val
-    ############################################################################################################
-    #Channel-wise scaling
-    if(channel_scale_mode == 1): #weight-only
-        scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
-        acc      = acc.to(meta_dtype) * scales_b[None, :]
-
-    if(channel_scale_mode == 2): #activation-only
-        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=meta_dtype)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
-
-    if(channel_scale_mode == 3): #weight + activation
-        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
-
-    ############################################################################################################
-    #Output: tl.atomic_add only supports 1D fp16 arrays, bfp16 would crash 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+    acc_fp32 = acc.to(tl.float32)
+    tl.atomic_add(c_ptrs, acc_fp32, sem=atomic_mode)
     
 KERNEL_CACHE = {}
 
