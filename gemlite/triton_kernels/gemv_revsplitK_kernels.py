@@ -198,7 +198,7 @@ def get_default_config_amd():
     return [config]
 
 def get_default_config_dcu():
-    config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':64, 'A_load_order':0, 'dot_prod_mode':0, 'waves_per_eu':2}, num_stages=2, num_warps=2, size_per_thread=8)
+    config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':64, 'A_load_order':0, 'dot_prod_mode':0, 'waves_per_eu':2}, num_stages=2, num_warps=2)
     return [config]
     configs = []
     # Hard-code the fixed parameters
